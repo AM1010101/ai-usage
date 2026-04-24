@@ -2,15 +2,17 @@
 
 It's annoying to dig through three different CLIs to figure out which one still has headroom before you kick off a big task — and even more annoying when you have more than one account so you have to sign in and out to check the usage.
 
-`ai-usage` is a tiny zero-dependency CLI that shows 5-hour and weekly usage for all your Codex, Claude, and Gemini accounts in one table, refreshes tokens automatically, and lets you swap which account is logged into with a single command.
+`ai-usage` is a tiny zero-dependency CLI that shows usage for all your Codex, Claude, Gemini, and Antigravity accounts in one table, refreshes tokens automatically where possible, and lets you swap which account is logged into with a single command.
 
 ## Example Output
 
-Name                	Provider        	5h Usage    		Weekly              	Status
+Default output is compact and focuses on usage columns. Use `--verbose` or `-v` to also show provider, plan, and status.
 
-claude              	claude     	4.0% (4h 52m)       	27.0% (20h 2m)      allowed
-codex-work      	codex      	0.0% (5h 0m)        	16.0% (6d 1h)       	ok
-codex-personal  	codex           	0.0% (5h 0m)        	70.0% (4d 12h)      	ok
+Name                	5h Usage    		Weekly
+
+claude              	4.0% (4h 52m)       	27.0% (20h 2m)
+codex-work      	0.0% (5h 0m)        	16.0% (6d 1h)
+codex-personal  	0.0% (5h 0m)        	70.0% (4d 12h)
 
 ## Install
 
@@ -29,9 +31,11 @@ Requires Node 18+.
 ai-usage add work --provider claude --local
 ai-usage add personal --provider codex --local
 ai-usage add gcp --provider gemini --local
+ai-usage add ag --provider antigravity --local
 
 # Check usage across all accounts
 ai-usage
+ai-usage --verbose
 
 # Switch ~/.codex/auth.json to a different account
 ai-usage use personal
@@ -41,9 +45,9 @@ ai-usage use personal
 
 | Command                                                   | Description                                                                                                                                                           |
 | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `add <name> [--provider codex\|claude\|gemini] [--local]` | Store credentials.`--local` reads full creds (with refresh token) from the provider's keychain/config file. Without `--local`, prompts for a pasted access token. |
+| `add <name> [--provider codex\|claude\|gemini\|antigravity] [--local]` | Store credentials. `--local` reads full creds from the provider's keychain/config file. Antigravity is local-only and must use `--local`. Without `--local`, other providers prompt for a pasted access token. |
 | `ls`                                                    | List stored accounts.`↻` means a refresh token is present.                                                                                                         |
-| `check [name...]`                                       | Refresh expired tokens, then print 5h / weekly usage. Default command.                                                                                                |
+| `check [name...] [--verbose\|-v]`                      | Refresh expired tokens, then print usage. Default output is compact; `--verbose` / `-v` adds provider, plan, and status columns.                                     |
 | `refresh [name...]`                                     | Force-refresh tokens.                                                                                                                                                 |
 | `use <name>`                                            | Write a codex account's credentials into `~/.codex/auth.json`.                                                                                                      |
 | `park <codex\|claude\|gemini>`                            | Blank the provider's local credentials file without revoking tokens.                                                                                                  |
@@ -54,5 +58,11 @@ ai-usage use personal
 - **Claude** — macOS keychain entry `Claude Code-credentials`
 - **Codex** — `~/.codex/auth.json`
 - **Gemini** — `~/.gemini/oauth_creds.json`
+- **Antigravity** — Antigravity panel snapshot in `~/Library/Application Support/Antigravity/User/globalStorage/state.vscdb`
+
+## Notes
+
+- **Antigravity** — one stored account can expand into multiple rows (`Gemini Pro`, `Gemini Flash`, `Other`) because the local IDE exposes separate quota groups.
+- **Gemini** — local import works from `~/.gemini/oauth_creds.json`, but some installs do not expose enough OAuth metadata for durable auto-refresh. If the imported Gemini access token expires, re-auth with `gemini auth login` and re-run `ai-usage add <name> --provider gemini --local`.
 
 Accounts are stored in `~/.codex-usage/accounts.json`.

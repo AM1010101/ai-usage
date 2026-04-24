@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// codex-usage CLI — manage and check usage for Codex / Claude / Gemini accounts.
+// codex-usage CLI — manage and check usage for Codex / Claude / Gemini / Antigravity accounts.
 // Zero dependencies, Node 18+.
 //
 // Usage:
-//   ai-usage add <name> [--provider codex|claude|gemini] [--local]
+//   ai-usage add <name> [--provider codex|claude|gemini|antigravity] [--local]
 //   ai-usage ls
 //   ai-usage check [name...]      # default command (runs if no subcommand given)
 //   ai-usage use <name>           # write token into ~/.codex/auth.json
@@ -31,6 +31,8 @@ const CODEX_USAGE = "https://chatgpt.com/backend-api/codex/usage";
 
 const GEMINI_LOAD = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GEMINI_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+const ANTIGRAVITY_STATE_DB = join(homedir(), "Library", "Application Support", "Antigravity", "User", "globalStorage", "state.vscdb");
 
 // ── Colors ──────────────────────────────────────────────────────────────────
 const c = {
@@ -51,6 +53,7 @@ const c = {
 //   claude:  { accessToken, refreshToken, expiresAt, scopes, subscriptionType, rateLimitTier }
 //   codex:   { auth_mode, tokens: { id_token, access_token, refresh_token, account_id }, last_refresh }
 //   gemini:  { access_token, refresh_token, client_id, client_secret, expiry_date }
+//   antigravity: { source: "local-state" }
 
 async function loadAccounts() {
   try {
@@ -98,10 +101,16 @@ async function readLocalGeminiCreds() {
   return parsed;
 }
 
+async function readLocalAntigravityCreds() {
+  await readFile(ANTIGRAVITY_STATE_DB);
+  return { source: "local-state" };
+}
+
 async function readLocalCreds(provider) {
   if (provider === "claude") return readLocalClaudeCreds();
   if (provider === "codex") return readLocalCodexCreds();
   if (provider === "gemini") return readLocalGeminiCreds();
+  if (provider === "antigravity") return readLocalAntigravityCreds();
   throw new Error(`Unknown provider: ${provider}`);
 }
 
@@ -110,6 +119,7 @@ function getAccessToken(provider, credentials) {
   if (provider === "claude") return credentials.accessToken;
   if (provider === "codex") return credentials.tokens?.access_token;
   if (provider === "gemini") return credentials.access_token;
+  if (provider === "antigravity") return "local-state";
   return null;
 }
 
@@ -169,9 +179,9 @@ async function refreshCodex(credentials) {
 
 async function refreshGemini(credentials) {
   const rt = credentials.refresh_token;
-  const clientId = credentials.client_id;
-  const clientSecret = credentials.client_secret;
-  if (!rt || !clientId || !clientSecret) throw new Error("Missing refresh_token, client_id, or client_secret");
+  const clientId = credentials.client_id || GEMINI_CLIENT_ID;
+  const clientSecret = credentials.client_secret || "";
+  if (!rt || !clientId) throw new Error("Missing refresh_token or client_id");
   const res = await fetch(GOOGLE_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -189,9 +199,38 @@ async function refreshGemini(credentials) {
   const data = await res.json();
   return {
     ...credentials,
+    client_id: clientId,
+    client_secret: credentials.client_secret,
     access_token: data.access_token,
     expiry_date: data.expires_in ? Date.now() + data.expires_in * 1000 : credentials.expiry_date,
   };
+}
+
+function canRefresh(provider, credentials) {
+  if (provider === "claude") return !!credentials.refreshToken;
+  if (provider === "codex") return !!credentials.tokens?.refresh_token;
+  if (provider === "gemini") return !!credentials.refresh_token && !!(credentials.client_secret || credentials.client_id);
+  if (provider === "antigravity") return false;
+  return false;
+}
+
+async function readAntigravityPanelState() {
+  const raw = await new Promise((resolve, reject) => {
+    execFile("sqlite3", [ANTIGRAVITY_STATE_DB, "select value from ItemTable where key = 'n2ns.antigravity-panel';"], (err, stdout, stderr) => {
+      if (err) {
+        return reject(new Error(stderr?.trim() || err.message || "sqlite3 failed"));
+      }
+      resolve(stdout.trim());
+    });
+  });
+
+  if (!raw) throw new Error("Antigravity panel state not found in globalStorage");
+
+  const parsed = JSON.parse(raw);
+  const snapshot = parsed["tfa.lastSnapshot"]?.data;
+  const viewState = parsed["tfa.lastViewState"];
+  if (!snapshot || !viewState) throw new Error("Antigravity quota snapshot missing");
+  return { snapshot, viewState };
 }
 
 function isExpired(provider, credentials) {
@@ -200,13 +239,14 @@ function isExpired(provider, credentials) {
     return credentials.expiresAt && Date.now() > credentials.expiresAt - buffer;
   }
   if (provider === "gemini") {
-    return credentials.expiry_date && Date.now() > credentials.expiry_date - buffer;
+    return canRefresh(provider, credentials) && credentials.expiry_date && Date.now() > credentials.expiry_date - buffer;
   }
   // Codex: no expiry field in auth.json, rely on last_refresh age (~8 day staleness)
   if (provider === "codex" && credentials.last_refresh) {
     const age = Date.now() - new Date(credentials.last_refresh).getTime();
     return age > 7 * 24 * 60 * 60 * 1000; // refresh if older than 7 days
   }
+  if (provider === "antigravity") return false;
   return false;
 }
 
@@ -215,6 +255,7 @@ async function refreshAccount(acc) {
   if (acc.provider === "claude") return refreshClaude(acc.credentials);
   if (acc.provider === "codex") return refreshCodex(acc.credentials);
   if (acc.provider === "gemini") return refreshGemini(acc.credentials);
+  if (acc.provider === "antigravity") return acc.credentials;
   throw new Error(`Unknown provider: ${acc.provider}`);
 }
 
@@ -373,12 +414,62 @@ async function checkGemini(token) {
   };
 }
 
+async function checkAntigravity() {
+  const { snapshot, viewState } = await readAntigravityPanelState();
+  const groups = Array.isArray(viewState.groups) ? viewState.groups.filter((g) => g?.hasData) : [];
+  const models = Array.isArray(snapshot.models) ? snapshot.models : [];
+  const normalizeGroupName = (label, id) => {
+    if (id === "gemini-pro") return "Gemini Pro";
+    if (id === "gemini-flash") return "Gemini Flash";
+    if (id === "claude" || id === "gpt") return "Other";
+    return label || id || "Unknown";
+  };
+  const visibleGroups = groups.filter((group) => group.id !== "gpt");
+
+  const results = visibleGroups.map((group) => {
+    const matchingModels = models.filter((m) => m.remainingPercentage === group.remaining && m.timeUntilReset === group.resetTime);
+    const model = matchingModels.find((m) => {
+      const label = (m.label || "").toLowerCase();
+      if (group.id === "gemini-pro") return label.includes("gemini") && label.includes("pro");
+      if (group.id === "gemini-flash") return label.includes("gemini") && label.includes("flash");
+      if (group.id === "claude") return label.includes("claude");
+      if (group.id === "gpt") return label.includes("gpt");
+      return true;
+    }) || matchingModels[0] || null;
+
+    return {
+      provider: "antigravity",
+      email: snapshot.userInfo?.email || null,
+      plan: snapshot.userInfo?.planName || snapshot.userInfo?.tier || null,
+      primary: {
+        used_percent: 100 - Number(group.remaining),
+        reset_seconds: model?.resetTime ? Math.max(0, Math.round((new Date(model.resetTime).getTime() - Date.now()) / 1000)) : null,
+        status: normalizeGroupName(group.label, group.id),
+      },
+      secondary: null,
+      status: "ok",
+      line_name: normalizeGroupName(group.label, group.id),
+    };
+  });
+
+  return results.length ? results : [{
+    provider: "antigravity",
+    email: snapshot.userInfo?.email || null,
+    plan: snapshot.userInfo?.planName || snapshot.userInfo?.tier || null,
+    primary: null,
+    secondary: null,
+    status: "ok",
+    line_name: "Antigravity",
+  }];
+}
+
 async function checkAccount(acc) {
   const token = getAccessToken(acc.provider, acc.credentials);
-  if (!token) throw new Error("No access token in stored credentials");
   if (acc.provider === "claude") return checkClaude(token);
   if (acc.provider === "codex") return checkCodex(token);
   if (acc.provider === "gemini") return checkGemini(token);
+  if (acc.provider === "antigravity") return checkAntigravity();
+  if (!token) throw new Error("No access token in stored credentials");
   throw new Error(`Unknown provider: ${acc.provider}`);
 }
 
@@ -419,15 +510,21 @@ function pad(str, len) {
   return str + " ".repeat(Math.max(0, len - visible.length));
 }
 
-function printTable(rows) {
-  const cols = [
-    { key: "name", label: "Name", width: 14 },
-    { key: "provider", label: "Provider", width: 9 },
-    { key: "plan", label: "Plan", width: 8 },
-    { key: "primary", label: "5h Usage", width: 20 },
-    { key: "secondary", label: "Weekly", width: 20 },
-    { key: "status", label: "Status", width: 8 },
-  ];
+function printTable(rows, opts = {}) {
+  const cols = opts.verbose
+    ? [
+        { key: "name", label: "Name", width: 14 },
+        { key: "provider", label: "Provider", width: 9 },
+        { key: "plan", label: "Plan", width: 8 },
+        { key: "primary", label: "5h Usage", width: 20 },
+        { key: "secondary", label: "Weekly", width: 20 },
+        { key: "status", label: "Status", width: 8 },
+      ]
+    : [
+        { key: "name", label: "Name", width: 14 },
+        { key: "primary", label: "5h Usage", width: 20 },
+        { key: "secondary", label: "Weekly", width: 20 },
+      ];
 
   for (const row of rows) {
     for (const col of cols) {
@@ -453,7 +550,7 @@ function printTable(rows) {
 async function cmdAdd(args) {
   const name = args[0];
   if (!name) {
-    console.error(`Usage: ai-usage add <name> [--provider codex|claude|gemini] [--local]`);
+    console.error(`Usage: ai-usage add <name> [--provider codex|claude|gemini|antigravity] [--local]`);
     process.exit(1);
   }
 
@@ -461,8 +558,8 @@ async function cmdAdd(args) {
   const provider = providerIdx !== -1 ? args[providerIdx + 1] : "codex";
   const local = args.includes("--local");
 
-  if (!["codex", "claude", "gemini"].includes(provider)) {
-    console.error(`Unknown provider: ${provider}. Use codex, claude, or gemini.`);
+  if (!["codex", "claude", "gemini", "antigravity"].includes(provider)) {
+    console.error(`Unknown provider: ${provider}. Use codex, claude, gemini, or antigravity.`);
     process.exit(1);
   }
 
@@ -476,6 +573,10 @@ async function cmdAdd(args) {
       process.exit(1);
     }
   } else {
+    if (provider === "antigravity") {
+      console.error(`Antigravity only supports --local because usage is read from the local IDE state.`);
+      process.exit(1);
+    }
     const token = await prompt(`Paste ${provider} access token: `);
     if (!token) { console.error("No token provided."); process.exit(1); }
     // Store as minimal credentials — no refresh token available when pasting manually
@@ -511,18 +612,16 @@ async function cmdLs() {
   for (const acc of accounts) {
     const token = getAccessToken(acc.provider, acc.credentials) || "???";
     const masked = token.length > 16 ? token.slice(0, 12) + "…" + token.slice(-4) : token;
-    const hasRefresh = acc.provider === "claude"
-      ? !!acc.credentials.refreshToken
-      : acc.provider === "codex"
-        ? !!acc.credentials.tokens?.refresh_token
-        : !!acc.credentials.refresh_token;
+    const hasRefresh = canRefresh(acc.provider, acc.credentials);
     const refreshIcon = hasRefresh ? c.green + "↻" + c.reset : c.gray + "—" + c.reset;
     console.log(`  ${c.bold}${acc.name}${c.reset}  ${c.cyan}${acc.provider}${c.reset}  ${c.gray}${masked}${c.reset}  ${refreshIcon}`);
   }
   console.log();
 }
 
-async function cmdCheck(names) {
+async function cmdCheck(args) {
+  const verbose = args.includes("--verbose") || args.includes("-v");
+  const names = args.filter((arg) => arg !== "--verbose" && arg !== "-v");
   const accounts = await loadAccounts();
   if (!accounts.length) {
     console.log(`${c.gray}No accounts. Run: ai-usage add <name>${c.reset}`);
@@ -545,32 +644,34 @@ async function cmdCheck(names) {
 
   console.log(`${c.dim}Checking ${targets.length} account(s)…${c.reset}`);
 
-  const rows = await Promise.all(
+  const rowGroups = await Promise.all(
     targets.map(async (acc) => {
       try {
         const result = await checkAccount(acc);
-        return {
-          name: c.bold + acc.name + c.reset,
-          provider: c.cyan + result.provider + c.reset,
-          plan: result.plan || "—",
-          primary: fmtWindow(result.primary),
-          secondary: fmtWindow(result.secondary),
-          status: fmtStatus(result.status),
-        };
+        const results = Array.isArray(result) ? result : [result];
+        return results.map((item) => ({
+          name: c.bold + (item.line_name ? `${acc.name}/${item.line_name}` : acc.name) + c.reset,
+          provider: c.cyan + item.provider + c.reset,
+          plan: item.plan || "—",
+          primary: fmtWindow(item.primary),
+          secondary: fmtWindow(item.secondary),
+          status: fmtStatus(item.status),
+        }));
       } catch (e) {
-        return {
+        return [{
           name: c.bold + acc.name + c.reset,
           provider: c.cyan + acc.provider + c.reset,
           plan: "—",
           primary: c.red + "error" + c.reset,
           secondary: c.red + e.message.slice(0, 40) + c.reset,
           status: c.red + "✗" + c.reset,
-        };
+        }];
       }
     }),
   );
 
-  printTable(rows);
+  const rows = rowGroups.flat();
+  printTable(rows, { verbose });
 }
 
 async function cmdRefresh(names) {
@@ -680,19 +781,21 @@ async function cmdRm(args) {
 
 function cmdHelp() {
   console.log(`
-${c.bold}ai-usage${c.reset} — check rate-limit usage for Codex / Claude / Gemini accounts
+${c.bold}ai-usage${c.reset} — check rate-limit usage for Codex / Claude / Gemini / Antigravity accounts
 
 ${c.bold}Commands:${c.reset}
-  add <name> [--provider codex|claude|gemini] [--local]
+  add <name> [--provider codex|claude|gemini|antigravity] [--local]
       Store credentials. --local reads full creds (with refresh token) from
       keychain/disk. Without --local, prompts for an access token only.
+      Antigravity is local-only and requires --local.
 
   ls
       List stored accounts. ${c.green}↻${c.reset} = has refresh token, ${c.gray}—${c.reset} = access token only.
 
-  check [name...]
+  check [name...] [--verbose|-v]
       Refresh expired tokens, then check usage. No args = check all.
       This is the default command — just running "ai-usage" does a check.
+      --verbose / -v adds provider, plan, and status columns.
 
   refresh [name...]
       Force-refresh tokens for named (or all) accounts.
@@ -715,8 +818,17 @@ ${c.bold}Examples:${c.reset}
   ${c.dim}# Add Codex from ~/.codex/auth.json${c.reset}
   ai-usage add personal --provider codex --local
 
+  ${c.dim}# Add Antigravity from Antigravity's local globalStorage${c.reset}
+  ai-usage add ag --provider antigravity --local
+
   ${c.dim}# Check all accounts${c.reset}
   ai-usage
+
+  ${c.dim}# Check all accounts with provider metadata${c.reset}
+  ai-usage --verbose
+
+  ${c.dim}# Short verbose flag${c.reset}
+  ai-usage -v
 
   ${c.dim}# Force refresh all tokens${c.reset}
   ai-usage refresh
@@ -727,9 +839,12 @@ ${c.bold}Examples:${c.reset}
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
-const [cmd, ...rest] = process.argv.slice(2);
+const argv = process.argv.slice(2);
+const defaultCheckFlags = new Set(["--verbose", "-v"]);
+const [cmd, ...rest] = argv;
+const treatAsDefaultCheck = cmd == null || defaultCheckFlags.has(cmd);
 
-switch (cmd) {
+switch (treatAsDefaultCheck ? undefined : cmd) {
   case "add":
     await cmdAdd(rest);
     break;
@@ -738,8 +853,10 @@ switch (cmd) {
     await cmdLs();
     break;
   case "check":
-  case undefined:
     await cmdCheck(rest);
+    break;
+  case undefined:
+    await cmdCheck(argv);
     break;
   case "refresh":
     await cmdRefresh(rest);
