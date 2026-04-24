@@ -1,16 +1,16 @@
 #!/usr/bin/env node
-// codex-usage CLI — manage and check usage for Codex / Claude / Gemini / Antigravity accounts.
+// codex-usage CLI — manage and check usage for Codex / Claude / Gemini / Antigravity / Kiro accounts.
 // Zero dependencies, Node 18+.
 //
 // Usage:
-//   ai-usage add <name> [--provider codex|claude|gemini|antigravity] [--local]
+//   ai-usage add <name> [--provider codex|claude|gemini|antigravity|kiro] [--local]
 //   ai-usage ls
 //   ai-usage check [name...]      # default command (runs if no subcommand given)
 //   ai-usage use <name>           # write token into ~/.codex/auth.json
 //   ai-usage rm <name>
 //   ai-usage refresh [name...]    # force-refresh tokens
 
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, readdir } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +33,7 @@ const GEMINI_LOAD = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssi
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GEMINI_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
 const ANTIGRAVITY_STATE_DB = join(homedir(), "Library", "Application Support", "Antigravity", "User", "globalStorage", "state.vscdb");
+const KIRO_LOGS_DIR = join(homedir(), "Library", "Application Support", "Kiro", "logs");
 
 // ── Colors ──────────────────────────────────────────────────────────────────
 const c = {
@@ -54,6 +55,7 @@ const c = {
 //   codex:   { auth_mode, tokens: { id_token, access_token, refresh_token, account_id }, last_refresh }
 //   gemini:  { access_token, refresh_token, client_id, client_secret, expiry_date }
 //   antigravity: { source: "local-state" }
+//   kiro: { source: "local-logs" }
 
 async function loadAccounts() {
   try {
@@ -106,11 +108,44 @@ async function readLocalAntigravityCreds() {
   return { source: "local-state" };
 }
 
+async function findFilesByName(root, target) {
+  const out = [];
+  const stack = [root];
+
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (entry.isFile() && entry.name === target) out.push(fullPath);
+    }
+  }
+
+  return out;
+}
+
+async function readLocalKiroCreds() {
+  const files = await findFilesByName(KIRO_LOGS_DIR, "q-client.log");
+  if (!files.length) throw new Error("No Kiro q-client.log found");
+  return { source: "local-logs" };
+}
+
 async function readLocalCreds(provider) {
   if (provider === "claude") return readLocalClaudeCreds();
   if (provider === "codex") return readLocalCodexCreds();
   if (provider === "gemini") return readLocalGeminiCreds();
   if (provider === "antigravity") return readLocalAntigravityCreds();
+  if (provider === "kiro") return readLocalKiroCreds();
   throw new Error(`Unknown provider: ${provider}`);
 }
 
@@ -120,6 +155,7 @@ function getAccessToken(provider, credentials) {
   if (provider === "codex") return credentials.tokens?.access_token;
   if (provider === "gemini") return credentials.access_token;
   if (provider === "antigravity") return "local-state";
+  if (provider === "kiro") return "local-logs";
   return null;
 }
 
@@ -210,7 +246,7 @@ function canRefresh(provider, credentials) {
   if (provider === "claude") return !!credentials.refreshToken;
   if (provider === "codex") return !!credentials.tokens?.refresh_token;
   if (provider === "gemini") return !!credentials.refresh_token && !!(credentials.client_secret || credentials.client_id);
-  if (provider === "antigravity") return false;
+  if (provider === "antigravity" || provider === "kiro") return false;
   return false;
 }
 
@@ -246,7 +282,7 @@ function isExpired(provider, credentials) {
     const age = Date.now() - new Date(credentials.last_refresh).getTime();
     return age > 7 * 24 * 60 * 60 * 1000; // refresh if older than 7 days
   }
-  if (provider === "antigravity") return false;
+  if (provider === "antigravity" || provider === "kiro") return false;
   return false;
 }
 
@@ -255,7 +291,7 @@ async function refreshAccount(acc) {
   if (acc.provider === "claude") return refreshClaude(acc.credentials);
   if (acc.provider === "codex") return refreshCodex(acc.credentials);
   if (acc.provider === "gemini") return refreshGemini(acc.credentials);
-  if (acc.provider === "antigravity") return acc.credentials;
+  if (acc.provider === "antigravity" || acc.provider === "kiro") return acc.credentials;
   throw new Error(`Unknown provider: ${acc.provider}`);
 }
 
@@ -408,7 +444,7 @@ async function checkGemini(token) {
     provider: "gemini",
     email: null,
     plan: tier,
-    primary: credits ? { used_percent: null, reset_seconds: null, status: credits } : null,
+    primary: { used_percent: null, reset_seconds: null, status: credits || tier || "ok" },
     secondary: null,
     status: "ok",
   };
@@ -438,6 +474,7 @@ async function checkAntigravity() {
     }) || matchingModels[0] || null;
 
     return {
+      table: "window",
       provider: "antigravity",
       email: snapshot.userInfo?.email || null,
       plan: snapshot.userInfo?.planName || snapshot.userInfo?.tier || null,
@@ -453,6 +490,7 @@ async function checkAntigravity() {
   });
 
   return results.length ? results : [{
+    table: "window",
     provider: "antigravity",
     email: snapshot.userInfo?.email || null,
     plan: snapshot.userInfo?.planName || snapshot.userInfo?.tier || null,
@@ -463,12 +501,71 @@ async function checkAntigravity() {
   }];
 }
 
+async function readLatestKiroUsage() {
+  const files = await findFilesByName(KIRO_LOGS_DIR, "q-client.log");
+  if (!files.length) throw new Error("No Kiro q-client.log found");
+
+  const snapshots = [];
+  for (const path of files) {
+    try {
+      const raw = await readFile(path, "utf8");
+      const line = raw
+        .split("\n")
+        .filter((entry) => entry.includes('"commandName":"GetUsageLimitsCommand"'))
+        .at(-1);
+      if (!line) continue;
+
+      const jsonStart = line.indexOf("{");
+      if (jsonStart === -1) continue;
+      const observedAtRaw = line.slice(0, jsonStart).trim().replace(" ", "T");
+      const observedAt = Number.isNaN(Date.parse(observedAtRaw)) ? 0 : Date.parse(observedAtRaw);
+      const parsed = JSON.parse(line.slice(jsonStart));
+      const breakdown = parsed.output?.usageBreakdownList?.[0];
+      if (!breakdown) continue;
+
+      const resetAt = parsed.output?.nextDateReset || breakdown.nextDateReset || null;
+      snapshots.push({
+        parsed,
+        breakdown,
+        resetAt,
+        observedAt,
+      });
+    } catch {}
+  }
+
+  snapshots.sort((a, b) => b.observedAt - a.observedAt);
+  if (!snapshots.length) throw new Error("Kiro usage snapshot not found in q-client.log");
+  return snapshots[0];
+}
+
+async function checkKiro() {
+  const { parsed, breakdown, resetAt } = await readLatestKiroUsage();
+  const used = Number(breakdown.currentUsageWithPrecision ?? breakdown.currentUsage ?? null);
+  const limit = Number(breakdown.usageLimitWithPrecision ?? breakdown.usageLimit ?? null);
+
+  return {
+    table: "monthly",
+    provider: "kiro",
+    email: null,
+    plan: parsed.output?.subscriptionInfo?.subscriptionTitle || null,
+    monthly: {
+      used,
+      limit,
+      used_percent: Number.isFinite(used) && Number.isFinite(limit) && limit > 0 ? (used / limit) * 100 : null,
+      unit: breakdown.displayNamePlural || breakdown.displayName || "Credits",
+      reset_seconds: resetAt ? Math.max(0, Math.round((new Date(resetAt).getTime() - Date.now()) / 1000)) : null,
+    },
+    status: "ok",
+  };
+}
+
 async function checkAccount(acc) {
   const token = getAccessToken(acc.provider, acc.credentials);
   if (acc.provider === "claude") return checkClaude(token);
   if (acc.provider === "codex") return checkCodex(token);
   if (acc.provider === "gemini") return checkGemini(token);
   if (acc.provider === "antigravity") return checkAntigravity();
+  if (acc.provider === "kiro") return checkKiro();
   if (!token) throw new Error("No access token in stored credentials");
   throw new Error(`Unknown provider: ${acc.provider}`);
 }
@@ -494,9 +591,19 @@ function fmtReset(secs) {
 
 function fmtWindow(w) {
   if (!w) return c.gray + "—" + c.reset;
+  if ((w.used_percent == null || isNaN(w.used_percent)) && w.status) {
+    return c.gray + String(w.status) + c.reset;
+  }
   const pct = fmtPct(w.used_percent);
   const reset = w.reset_seconds ? c.gray + ` (${fmtReset(w.reset_seconds)})` + c.reset : "";
   return pct + reset;
+}
+
+function fmtMonthly(m) {
+  if (!m) return c.gray + "—" + c.reset;
+  const pct = fmtPct(m.used_percent);
+  if (!Number.isFinite(m.used) || !Number.isFinite(m.limit)) return pct;
+  return `${pct}${c.gray} (${m.used.toFixed(2)}/${m.limit} ${m.unit || ""})${c.reset}`;
 }
 
 function fmtStatus(s) {
@@ -510,7 +617,7 @@ function pad(str, len) {
   return str + " ".repeat(Math.max(0, len - visible.length));
 }
 
-function printTable(rows, opts = {}) {
+function printWindowTable(rows, opts = {}) {
   const cols = opts.verbose
     ? [
         { key: "name", label: "Name", width: 14 },
@@ -546,11 +653,48 @@ function printTable(rows, opts = {}) {
   console.log();
 }
 
+function printMonthlyTable(rows, opts = {}) {
+  const cols = opts.verbose
+    ? [
+        { key: "name", label: "Name", width: 14 },
+        { key: "provider", label: "Provider", width: 9 },
+        { key: "plan", label: "Plan", width: 8 },
+        { key: "monthly", label: "Monthly", width: 30 },
+        { key: "reset", label: "Reset", width: 10 },
+        { key: "status", label: "Status", width: 8 },
+      ]
+    : [
+        { key: "name", label: "Name", width: 14 },
+        { key: "monthly", label: "Monthly", width: 30 },
+        { key: "reset", label: "Reset", width: 10 },
+      ];
+
+  for (const row of rows) {
+    for (const col of cols) {
+      const val = String(row[col.key] ?? "");
+      const visible = val.replace(/\x1b\[[0-9;]*m/g, "");
+      col.width = Math.max(col.width, visible.length + 2);
+    }
+  }
+
+  const header = cols.map((col) => c.dim + pad(col.label, col.width) + c.reset).join("");
+  console.log();
+  console.log(c.bold + "Monthly Usage" + c.reset);
+  console.log(header);
+  console.log(c.dim + "─".repeat(cols.reduce((s, col) => s + col.width, 0)) + c.reset);
+
+  for (const row of rows) {
+    const line = cols.map((col) => pad(String(row[col.key] ?? ""), col.width)).join("");
+    console.log(line);
+  }
+  console.log();
+}
+
 // ── Commands ────────────────────────────────────────────────────────────────
 async function cmdAdd(args) {
   const name = args[0];
   if (!name) {
-    console.error(`Usage: ai-usage add <name> [--provider codex|claude|gemini|antigravity] [--local]`);
+    console.error(`Usage: ai-usage add <name> [--provider codex|claude|gemini|antigravity|kiro] [--local]`);
     process.exit(1);
   }
 
@@ -558,8 +702,8 @@ async function cmdAdd(args) {
   const provider = providerIdx !== -1 ? args[providerIdx + 1] : "codex";
   const local = args.includes("--local");
 
-  if (!["codex", "claude", "gemini", "antigravity"].includes(provider)) {
-    console.error(`Unknown provider: ${provider}. Use codex, claude, gemini, or antigravity.`);
+  if (!["codex", "claude", "gemini", "antigravity", "kiro"].includes(provider)) {
+    console.error(`Unknown provider: ${provider}. Use codex, claude, gemini, antigravity, or kiro.`);
     process.exit(1);
   }
 
@@ -573,8 +717,9 @@ async function cmdAdd(args) {
       process.exit(1);
     }
   } else {
-    if (provider === "antigravity") {
-      console.error(`Antigravity only supports --local because usage is read from the local IDE state.`);
+    if (provider === "antigravity" || provider === "kiro") {
+      const label = provider[0].toUpperCase() + provider.slice(1);
+      console.error(`${label} only supports --local because usage is read from the local IDE state.`);
       process.exit(1);
     }
     const token = await prompt(`Paste ${provider} access token: `);
@@ -650,20 +795,26 @@ async function cmdCheck(args) {
         const result = await checkAccount(acc);
         const results = Array.isArray(result) ? result : [result];
         return results.map((item) => ({
+          table: item.table || "window",
           name: c.bold + (item.line_name ? `${acc.name}/${item.line_name}` : acc.name) + c.reset,
           provider: c.cyan + item.provider + c.reset,
           plan: item.plan || "—",
           primary: fmtWindow(item.primary),
           secondary: fmtWindow(item.secondary),
+          monthly: fmtMonthly(item.monthly),
+          reset: item.monthly?.reset_seconds == null ? c.gray + "—" + c.reset : c.gray + fmtReset(item.monthly.reset_seconds) + c.reset,
           status: fmtStatus(item.status),
         }));
       } catch (e) {
         return [{
+          table: acc.provider === "kiro" ? "monthly" : "window",
           name: c.bold + acc.name + c.reset,
           provider: c.cyan + acc.provider + c.reset,
           plan: "—",
           primary: c.red + "error" + c.reset,
           secondary: c.red + e.message.slice(0, 40) + c.reset,
+          monthly: c.red + "error" + c.reset,
+          reset: c.red + e.message.slice(0, 24) + c.reset,
           status: c.red + "✗" + c.reset,
         }];
       }
@@ -671,7 +822,11 @@ async function cmdCheck(args) {
   );
 
   const rows = rowGroups.flat();
-  printTable(rows, { verbose });
+  const windowRows = rows.filter((row) => row.table === "window");
+  const monthlyRows = rows.filter((row) => row.table === "monthly");
+
+  if (windowRows.length) printWindowTable(windowRows, { verbose });
+  if (monthlyRows.length) printMonthlyTable(monthlyRows, { verbose });
 }
 
 async function cmdRefresh(names) {
@@ -781,13 +936,13 @@ async function cmdRm(args) {
 
 function cmdHelp() {
   console.log(`
-${c.bold}ai-usage${c.reset} — check rate-limit usage for Codex / Claude / Gemini / Antigravity accounts
+${c.bold}ai-usage${c.reset} — check rate-limit usage for Codex / Claude / Gemini / Antigravity / Kiro accounts
 
 ${c.bold}Commands:${c.reset}
-  add <name> [--provider codex|claude|gemini|antigravity] [--local]
+  add <name> [--provider codex|claude|gemini|antigravity|kiro] [--local]
       Store credentials. --local reads full creds (with refresh token) from
       keychain/disk. Without --local, prompts for an access token only.
-      Antigravity is local-only and requires --local.
+      Antigravity and Kiro are local-only and require --local.
 
   ls
       List stored accounts. ${c.green}↻${c.reset} = has refresh token, ${c.gray}—${c.reset} = access token only.
@@ -820,6 +975,9 @@ ${c.bold}Examples:${c.reset}
 
   ${c.dim}# Add Antigravity from Antigravity's local globalStorage${c.reset}
   ai-usage add ag --provider antigravity --local
+
+  ${c.dim}# Add Kiro from Kiro's local q-client usage log${c.reset}
+  ai-usage add kiro --provider kiro --local
 
   ${c.dim}# Check all accounts${c.reset}
   ai-usage
