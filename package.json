@@ -1,0 +1,9 @@
+{
+  "name": "ai-usage",
+  "version": "1.0.0",
+  "description": "Check rate-limit usage for Codex / Claude / Gemini accounts",
+  "type": "module",
+  "bin": {
+    "ai-usage": "./cli.mjs"
+  }
+}
